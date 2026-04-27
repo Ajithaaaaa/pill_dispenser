@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -7,8 +8,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:workmanager/workmanager.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:timezone/data/latest_all.dart' as tz;
-import 'package:timezone/timezone.dart' as tz;
 import 'l10n.dart';
 
 // ─── Global Notification Plugin ───────────────────────────────────────────────
@@ -32,19 +31,18 @@ const _notifDetails = NotificationDetails(
   ),
 );
 
-// ─── WorkManager Callback (backup — only if zonedSchedule somehow fails) ──────
+// ─── WorkManager Callback (runs in separate isolate when app is killed) ───────
 @pragma('vm:entry-point')
 void callbackDispatcher() {
   Workmanager().executeTask((task, inputData) async {
     try {
+      // Re-init notifications in background isolate
       final plugin = FlutterLocalNotificationsPlugin();
       await plugin.initialize(
         const InitializationSettings(
             android: AndroidInitializationSettings('@mipmap/ic_launcher')),
       );
-      final label = inputData?['label'] ?? 'Dose';
-      final emoji = inputData?['emoji'] ?? '\u{1F48A}';
-      final motor = (inputData?['motor'] as num?)?.toInt() ?? 99;
+
       const localDetails = NotificationDetails(
         android: AndroidNotificationDetails(
           'pillbot_alarm',
@@ -60,12 +58,76 @@ void callbackDispatcher() {
               'content://settings/system/alarm_alert'),
         ),
       );
-      await plugin.show(
-        motor,
-        '$emoji Time for your $label tablet!',
-        '\u{1F48A} Your pill dispenser is dispensing now. Please collect your tablet!',
-        localDetails,
-      );
+
+      // ── Task: pillReminder — scheduled alarm fired ──
+      if (task == 'pillReminder') {
+        final label = inputData?['label'] ?? 'Dose';
+        final emoji  = inputData?['emoji']  ?? '💊';
+        final motor  = (inputData?['motor'] as num?)?.toInt() ?? 99;
+
+        await plugin.show(
+          motor,
+          '$emoji Time for your $label tablet!',
+          '💊 Your pill dispenser is dispensing now. Please collect your tablet!',
+          localDetails,
+        );
+
+        // Re-schedule for tomorrow
+        final prefs = await SharedPreferences.getInstance();
+        final h = prefs.getInt('${motor}_h');
+        final m = prefs.getInt('${motor}_m');
+        if (h != null && m != null) {
+          final now  = DateTime.now();
+          final next = DateTime(now.year, now.month, now.day + 1, h, m);
+          await Workmanager().registerOneOffTask(
+            'pill_$motor',
+            'pillReminder',
+            initialDelay: next.difference(now),
+            inputData: inputData,
+            existingWorkPolicy: ExistingWorkPolicy.replace,
+            constraints: Constraints(
+              networkType: NetworkType.notRequired,
+              requiresBatteryNotLow: false,
+              requiresCharging: false,
+              requiresDeviceIdle: false,
+              requiresStorageNotLow: false,
+            ),
+          );
+        }
+      }
+
+      // ── Task: piDoseCheck — periodic Pi poll (every 15 min) ──
+      // Fires a notification if the Pi has doses waiting in the queue.
+      // This catches missed doses when internet was off at scheduled time.
+      else if (task == 'piDoseCheck') {
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          final piBase = prefs.getString('pi_base') ?? 'http://10.0.142.112:5000';
+          // We import http in background — use dart:io HttpClient instead
+          // (http package may not work in isolate without full init)
+          final uri = Uri.parse('$piBase/');
+          final client = HttpClient();
+          client.connectionTimeout = const Duration(seconds: 5);
+          final req = await client.getUrl(uri);
+          final res = await req.close();
+          if (res.statusCode == 200) {
+            final body = await res.transform(utf8.decoder).join();
+            final data = jsonDecode(body);
+            final waiting = (data['waiting'] as List?)?.cast<String>() ?? [];
+            if (waiting.isNotEmpty) {
+              await plugin.show(
+                200,
+                '💊 Pill Ready to Collect!',
+                '⚠️ Your pill dispenser has ${waiting.length} dose(s) waiting. Open the app to collect.',
+                localDetails,
+              );
+            }
+          }
+          client.close();
+        } catch (_) {
+          // Pi not reachable — silently skip
+        }
+      }
     } catch (e) {
       return false;
     }
@@ -73,12 +135,8 @@ void callbackDispatcher() {
   });
 }
 
-// ─── Init notifications + timezone ─────────────────────────────────────────────
+// ─── Init notifications ────────────────────────────────────────────────────────
 Future<void> _initNotifications() async {
-  // Initialize timezone data (required for zonedSchedule)
-  tz.initializeTimeZones();
-  tz.setLocalLocation(tz.getLocation('Asia/Kolkata'));
-
   const android = AndroidInitializationSettings('@mipmap/ic_launcher');
   await _notifPlugin.initialize(
       const InitializationSettings(android: android));
@@ -87,7 +145,6 @@ Future<void> _initNotifications() async {
       .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin>();
   await androidPlugin?.requestNotificationsPermission();
-  await androidPlugin?.requestExactAlarmsPermission();
 }
 
 // ─── Fires notification + alarm sound IMMEDIATELY ─────────────────────────────
@@ -98,44 +155,11 @@ Future<void> _showImmediateNotif(String label, String emoji, int id) async {
     '\u{1F48A} Your pill dispenser is dispensing now. Please collect your tablet!',
     _notifDetails,
   );
+  // Alarm sound plays via notification channel alarm URI
 }
 
-// ─── Schedule exact daily notification using AlarmManager (PRIMARY) ───────────
-// This uses Android AlarmManager.setExactAndAllowWhileIdle() under the hood.
-// It fires at the EXACT time even when the app is killed, in Doze mode, or offline.
-Future<void> _scheduleDailyNotif(int motor, String label, String emoji,
-    TimeOfDay t) async {
-  // Cancel any existing notification for this motor
-  await _notifPlugin.cancel(motor);
-
-  // Calculate the next occurrence of this time
-  final now = tz.TZDateTime.now(tz.local);
-  var scheduled = tz.TZDateTime(
-    tz.local, now.year, now.month, now.day, t.hour, t.minute,
-  );
-  // If the time has already passed today, schedule for tomorrow
-  if (scheduled.isBefore(now)) {
-    scheduled = scheduled.add(const Duration(days: 1));
-  }
-
-  debugPrint('[ALARM] Scheduling $label (motor $motor) at $scheduled (daily repeat)');
-
-  await _notifPlugin.zonedSchedule(
-    motor, // unique notification ID per motor
-    '$emoji Time for your $label tablet!',
-    '\u{1F48A} Your pill dispenser is dispensing now. Please collect your tablet!',
-    scheduled,
-    _notifDetails,
-    androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
-    uiLocalNotificationDateInterpretation:
-        UILocalNotificationDateInterpretation.absoluteTime,
-    matchDateTimeComponents: DateTimeComponents.time, // ← REPEATS DAILY at same time
-    payload: 'motor_$motor',
-  );
-}
-
-// ─── Register WorkManager as BACKUP (secondary, in case AlarmManager is cleared) ─
-Future<void> _registerBackupWorkManager(int motor, String label, String emoji,
+// ─── Register WorkManager task for a dose ────────────────────────────────────
+Future<void> _registerDoseTask(int motor, String label, String emoji,
     TimeOfDay t) async {
   final now = DateTime.now();
   var scheduled = DateTime(now.year, now.month, now.day, t.hour, t.minute);
@@ -148,6 +172,7 @@ Future<void> _registerBackupWorkManager(int motor, String label, String emoji,
     initialDelay: scheduled.difference(now),
     inputData: {'motor': motor, 'label': label, 'emoji': emoji},
     existingWorkPolicy: ExistingWorkPolicy.replace,
+    // KEY FIX: No network needed — notification fires without Pi WiFi
     constraints: Constraints(
       networkType: NetworkType.notRequired,
       requiresBatteryNotLow: false,
@@ -156,15 +181,6 @@ Future<void> _registerBackupWorkManager(int motor, String label, String emoji,
       requiresStorageNotLow: false,
     ),
   );
-}
-
-// ─── Combined: Schedule both AlarmManager + WorkManager backup ───────────────
-Future<void> _registerDoseTask(int motor, String label, String emoji,
-    TimeOfDay t) async {
-  // PRIMARY: Exact AlarmManager-based notification (fires even when app killed)
-  await _scheduleDailyNotif(motor, label, emoji, t);
-  // BACKUP: WorkManager (in case system clears AlarmManager on reboot without receiver)
-  await _registerBackupWorkManager(motor, label, emoji, t);
 }
 
 bool _notifPermissionOk = true;
@@ -237,6 +253,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   bool _connected = false;
   bool _permissionOk = false;
   bool _isRegisteringFace = false;
+  bool _isTestingFace = false;
   int _timeLimit = 30;
   String _lang = 'en';
   Timer? _pingTimer;
@@ -275,6 +292,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     _checkPermission();
     _requestBatteryOptimizationExemption();
     _reRegisterAllDoseTasks(); // Re-register on every app startup as safety net
+    _checkPiForPendingDoses();  // Check if Pi has any doses waiting right now
     _pingTimer = Timer.periodic(const Duration(seconds: 10), (_) => _pingServer());
   }
 
@@ -326,6 +344,45 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         debugPrint('[WORKMANAGER] Re-registered task for ${d.label} at $h:$m');
       }
     }
+    // Also schedule a periodic Pi-check task (every 15 min) to catch doses
+    // that fire while app is closed and Pi is back online
+    await Workmanager().registerPeriodicTask(
+      'pi_dose_check',
+      'piDoseCheck',
+      frequency: const Duration(minutes: 15),
+      existingWorkPolicy: ExistingPeriodicWorkPolicy.keep,
+      constraints: Constraints(
+        networkType: NetworkType.notRequired,
+        requiresBatteryNotLow: false,
+        requiresCharging: false,
+        requiresDeviceIdle: false,
+        requiresStorageNotLow: false,
+      ),
+    );
+  }
+
+  // ── Check Pi for any doses currently waiting (fires notif if found) ──
+  Future<void> _checkPiForPendingDoses() async {
+    try {
+      final res = await http
+          .get(Uri.parse('$_base/'))
+          .timeout(const Duration(seconds: 5));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final waiting = data['waiting'] as List<dynamic>? ?? [];
+        if (waiting.isNotEmpty) {
+          // There are doses waiting — fire a notification immediately
+          for (final motorNum in waiting) {
+            final motor = int.tryParse(motorNum.toString()) ?? 0;
+            final dose = _doses.where((d) => d.motor == motor).firstOrNull;
+            if (dose != null) {
+              await _showImmediateNotif(dose.label, dose.emoji, motor);
+              debugPrint('[PI CHECK] Fired notification for waiting motor $motor');
+            }
+          }
+        }
+      }
+    } catch (_) {}
   }
 
 
@@ -534,6 +591,155 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ));
     }
+  }
+
+  // ── Test Face Detection on Pi ──
+  Future<void> _testFaceDetection() async {
+    if (!_connected) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('❌ Not connected to Pi. Check your Wi-Fi.'),
+        backgroundColor: Color(0xFFFF5252),
+        behavior: SnackBarBehavior.floating,
+      ));
+      return;
+    }
+    setState(() => _isTestingFace = true);
+    try {
+      final res = await http
+          .get(Uri.parse('$_base/face_debug'))
+          .timeout(const Duration(seconds: 15));
+      final data = jsonDecode(res.body) as Map<String, dynamic>;
+      if (!mounted) return;
+
+      final isMatch = data['match'] == true;
+      final confidence = data['confidence'];
+      final facesDetected = data['faces_detected'] ?? 0;
+      final message = data['message'] ?? '';
+      final threshold = data['threshold_confidence'];
+      final timestamp = data['timestamp'] ?? '';
+      final error = data['error'];
+
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: const Color(0xFF141828),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          title: Row(children: [
+            Text(isMatch ? '✅' : (facesDetected > 0 ? '❌' : '📷'),
+                style: const TextStyle(fontSize: 24)),
+            const SizedBox(width: 8),
+            Expanded(child: Text('Face Detection Result',
+                style: const TextStyle(color: Colors.white, fontSize: 16,
+                    fontWeight: FontWeight.w700))),
+          ]),
+          content: Column(mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+            if (error != null) ...[  
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFF5252).withAlpha(25),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(error, style: const TextStyle(color: Color(0xFFFF5252))),
+              ),
+            ] else ...[  
+              _faceResultRow('Faces detected', '$facesDetected',
+                  facesDetected > 0 ? Colors.green : Colors.orange),
+              const SizedBox(height: 8),
+              if (confidence != null) ...[  
+                _faceResultRow('Confidence', '$confidence%',
+                    isMatch ? const Color(0xFF00D4AA) : const Color(0xFFFF8C42)),
+                const SizedBox(height: 8),
+                _faceResultRow('Required', '>$threshold%', Colors.white54),
+                const SizedBox(height: 8),
+              ],
+              _faceResultRow('Result', isMatch ? 'MATCH ✅' : 'NO MATCH ❌',
+                  isMatch ? const Color(0xFF00D4AA) : const Color(0xFFFF5252)),
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Colors.white.withAlpha(10),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(message,
+                    style: const TextStyle(color: Colors.white70, fontSize: 12)),
+              ),
+              if (timestamp.isNotEmpty) ...[  
+                const SizedBox(height: 6),
+                Text('Tested at: $timestamp',
+                    style: const TextStyle(color: Colors.white38, fontSize: 11)),
+              ],
+              if (!isMatch && facesDetected > 0) ...[  
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFF8C42).withAlpha(25),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFFFF8C42).withAlpha(80)),
+                  ),
+                  child: const Text(
+                    '💡 Tips:\n• Ensure good lighting\n• Face the camera directly\n• Re-register your face if needed',
+                    style: TextStyle(color: Color(0xFFFF8C42), fontSize: 11),
+                  ),
+                ),
+              ],
+              if (facesDetected == 0) ...[  
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF6C63FF).withAlpha(25),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF6C63FF).withAlpha(80)),
+                  ),
+                  child: const Text(
+                    '💡 Tips:\n• Stand in front of the Pi camera\n• Ensure the camera is connected\n• Check lighting conditions',
+                    style: TextStyle(color: Color(0xFF6C63FF), fontSize: 11),
+                  ),
+                ),
+              ],
+            ],
+          ]),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Close', style: TextStyle(color: Color(0xFF6C63FF))),
+            ),
+            if (!isMatch)
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  _captureAndSendFace();
+                },
+                child: const Text('Re-register Face',
+                    style: TextStyle(color: Color(0xFF00D4AA))),
+              ),
+          ],
+        ),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('❌ Error: ${e.toString()}'),
+          backgroundColor: const Color(0xFFFF5252),
+          behavior: SnackBarBehavior.floating,
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _isTestingFace = false);
+    }
+  }
+
+  Widget _faceResultRow(String label, String value, Color valueColor) {
+    return Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+      Text(label, style: const TextStyle(color: Colors.white54, fontSize: 13)),
+      Text(value, style: TextStyle(color: valueColor, fontSize: 13,
+          fontWeight: FontWeight.w700)),
+    ]);
   }
 
   // ── Capture and Send Face ──
@@ -887,6 +1093,29 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
               backgroundColor: const Color(0xFF00D4AA),
               foregroundColor: Colors.white,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+
+        // ── Test Face Detection Button ──
+        SizedBox(
+          width: double.infinity,
+          height: 48,
+          child: OutlinedButton.icon(
+            onPressed: _isTestingFace ? null : _testFaceDetection,
+            icon: _isTestingFace
+                ? const SizedBox(width: 16, height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2,
+                        color: Color(0xFFFF8C42)))
+                : const Icon(Icons.camera_alt_rounded, size: 18),
+            label: Text(_isTestingFace ? 'Testing...' : 'Test Face Detection',
+                style: const TextStyle(fontSize: 13)),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: const Color(0xFFFF8C42),
+              side: const BorderSide(color: Color(0xFFFF8C42), width: 1.5),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12)),
             ),
           ),
         ),

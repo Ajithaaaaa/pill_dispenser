@@ -87,6 +87,16 @@ config    = load_json(CONFIG_FILE, {"time_limit": 30})
 dispensed_today = {}  
 waiting_queue   = {}  # {"motor_num": {"start": datetime_obj, "limit": 30}}
 
+# ─── Live Face Detection Tracking (for debug) ─────────────────────────────────
+last_face_result = {
+    "timestamp": None,
+    "faces_detected": 0,
+    "match": False,
+    "distance": None,
+    "confidence": None,
+    "message": "No detection yet"
+}
+
 # ─── Face Recognition Setup ───────────────────────────────────────────────────
 reference_encoding = None
 
@@ -106,15 +116,42 @@ def load_reference_face():
 
 load_reference_face()
 
-def init_camera():
-    # Try multiple camera indices to support whatever is connected
+# ─── Shared Camera (one instance, shared between thread + debug endpoint) ─────
+_camera_lock = threading.Lock()
+_shared_cap   = None
+
+def init_shared_camera():
+    """Open the camera once and store in _shared_cap. Call at startup."""
+    global _shared_cap
     for i in [0, 1, 2]:
         cap = cv2.VideoCapture(i)
         if cap is not None and cap.isOpened():
-            print(f"[CAMERA] Connected to camera index {i}")
-            return cap
-    print("[CAMERA] WARNING: No camera found!")
-    return None
+            print(f"[CAMERA] Shared camera connected on index {i}")
+            _shared_cap = cap
+            return
+    print("[CAMERA] WARNING: No camera found! Face detection will not work.")
+    _shared_cap = None
+
+def grab_frame():
+    """Thread-safe: grab one frame from the shared camera.
+    Returns (True, frame) or (False, None)."""
+    global _shared_cap
+    with _camera_lock:
+        if _shared_cap is None or not _shared_cap.isOpened():
+            # Try to reopen
+            for i in [0, 1, 2]:
+                cap = cv2.VideoCapture(i)
+                if cap is not None and cap.isOpened():
+                    print(f"[CAMERA] Reconnected on index {i}")
+                    _shared_cap = cap
+                    break
+            else:
+                return False, None
+        ret, frame = _shared_cap.read()
+        return ret, frame if ret else None
+
+# Open the camera immediately at startup
+init_shared_camera()
 
 # ─── Background Camera Thread ────────────────────────────────────────────────
 # FACE MATCH TOLERANCE: Lower = stricter. 0.45 is strict, 0.6 is default/loose.
@@ -123,12 +160,11 @@ FACE_MATCH_TOLERANCE = 0.45
 CONSECUTIVE_MATCHES_REQUIRED = 3
 
 def camera_loop():
-    global waiting_queue, dispensed_today
+    global waiting_queue, dispensed_today, last_face_result
     print("[CAMERA THREAD] Started.")
     print(f"[CAMERA THREAD] Face tolerance: {FACE_MATCH_TOLERANCE} (lower=stricter)")
     print(f"[CAMERA THREAD] Consecutive matches required: {CONSECUTIVE_MATCHES_REQUIRED}")
     
-    cap = init_camera()
     consecutive_match_count = 0
     
     while True:
@@ -151,17 +187,12 @@ def camera_loop():
             print("[FACE] Pills will NOT dispense until a face is registered.")
             time.sleep(10)
             continue
-            
-        if cap is None or not cap.isOpened():
-            # Try to reconnect
-            cap = init_camera()
-            if cap is None:
-                time.sleep(5)
-                continue
 
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(1)
+        # ── Use shared camera (no separate open/close) ──
+        ret, frame = grab_frame()
+        if not ret or frame is None:
+            print("[CAMERA THREAD] Could not grab frame, retrying...")
+            time.sleep(2)
             continue
             
         # Optimization: resize frame for faster face detection
@@ -173,6 +204,14 @@ def camera_loop():
         
         if not face_locations:
             consecutive_match_count = 0  # Reset on no face detected
+            last_face_result.update({
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "faces_detected": 0,
+                "match": False,
+                "distance": None,
+                "confidence": None,
+                "message": "No face detected in frame"
+            })
             time.sleep(0.5)
             continue
             
@@ -183,6 +222,15 @@ def camera_loop():
             face_distance = face_recognition.face_distance([reference_encoding], face_encoding)[0]
             is_match = face_distance <= FACE_MATCH_TOLERANCE
             confidence = round((1.0 - face_distance) * 100, 1)
+            
+            last_face_result.update({
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "faces_detected": len(face_locations),
+                "match": bool(is_match),
+                "distance": round(float(face_distance), 3),
+                "confidence": confidence,
+                "message": f"✅ MATCH! Confidence: {confidence}%" if is_match else f"❌ No match. Confidence: {confidence}% (need >{round((1 - FACE_MATCH_TOLERANCE)*100,1)}%)"
+            })
             
             if is_match:
                 print(f"[FACE] ✅ Match! Distance: {face_distance:.3f} | Confidence: {confidence}% | Threshold: {FACE_MATCH_TOLERANCE}")
@@ -421,7 +469,86 @@ def face_status():
         "face_match_tolerance": FACE_MATCH_TOLERANCE,
         "consecutive_matches_required": CONSECUTIVE_MATCHES_REQUIRED,
         "waiting_queue": list(waiting_queue.keys()),
-        "time_limit_mins": config.get("time_limit", 30)
+        "time_limit_mins": config.get("time_limit", 30),
+        "last_detection": last_face_result
+    })
+
+@app.route('/face_debug', methods=['GET'])
+def face_debug():
+    """Live face detection test — captures a frame NOW and returns detection results."""
+    if not face_recognition:
+        return jsonify({
+            "error": "face_recognition library not installed",
+            "faces_detected": 0,
+            "match": False,
+            "message": "Install face_recognition on Raspberry Pi first"
+        }), 500
+
+    if reference_encoding is None:
+        return jsonify({
+            "error": "No reference face registered",
+            "faces_detected": 0,
+            "match": False,
+            "message": "Please register a face via the app first"
+        }), 400
+
+    # ── Grab frame from shared camera (no second open!) ──
+    ret, frame = grab_frame()
+    if not ret or frame is None:
+        return jsonify({
+            "error": "Camera not available or busy",
+            "faces_detected": 0,
+            "match": False,
+            "message": "Could not read from Pi camera. Make sure camera is connected and not physically disconnected."
+        }), 500
+
+    # Run face recognition
+    small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+    rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+    face_locations = face_recognition.face_locations(rgb_small_frame)
+
+    if not face_locations:
+        return jsonify({
+            "faces_detected": 0,
+            "match": False,
+            "distance": None,
+            "confidence": None,
+            "tolerance": FACE_MATCH_TOLERANCE,
+            "message": "❌ No face detected in camera frame. Make sure your face is visible to the Pi camera."
+        })
+
+    face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+    results = []
+    best_match = False
+    best_distance = 1.0
+    best_confidence = 0.0
+
+    for enc in face_encodings:
+        dist = float(face_recognition.face_distance([reference_encoding], enc)[0])
+        conf = round((1.0 - dist) * 100, 1)
+        is_match = bool(dist <= FACE_MATCH_TOLERANCE)
+        if dist < best_distance:
+            best_distance = dist
+            best_confidence = conf
+            best_match = is_match
+        results.append({"distance": round(dist, 3), "confidence": conf, "match": is_match})
+
+    threshold_confidence = round((1.0 - FACE_MATCH_TOLERANCE) * 100, 1)
+    if best_match:
+        msg = f"✅ MATCH! Confidence: {best_confidence}% (need >{threshold_confidence}%)"
+    else:
+        msg = f"❌ No match. Confidence: {best_confidence}% (need >{threshold_confidence}%). Try better lighting or re-register face."
+
+    return jsonify({
+        "faces_detected": int(len(face_locations)),
+        "match": bool(best_match),
+        "distance": round(float(best_distance), 3),
+        "confidence": float(best_confidence),
+        "tolerance": float(FACE_MATCH_TOLERANCE),
+        "threshold_confidence": float(threshold_confidence),
+        "all_faces": results,
+        "message": msg,
+        "timestamp": datetime.now().strftime("%H:%M:%S")
     })
 
 if __name__ == '__main__':
